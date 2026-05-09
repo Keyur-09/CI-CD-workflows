@@ -109,6 +109,19 @@ jobs:
         with:
           name: deployment-package
 
+      - name: Test SSH Connection
+        env:
+           EC2_HOST: ${{ secrets.EC2_HOST }}
+           EC2_USERNAME: ${{ secrets.EC2_username }}
+           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+           
+        run: |
+          echo "SSH_PRIVATE-KEY" > private_key.pem
+          chmod 600 private_key.pem
+
+          ssh -v  -i private_key.pem -o StrricthostkeyChecking=no \
+          ${EC2_USERNAME}@{EC2_HOST} " echo connected "
+
       - name: Deploy Application to EC2
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
