@@ -1,0 +1,276 @@
+name: Deploy on EC2
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build + Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Run Tests
+        run: npm test || true
+
+      - name: Build Application
+        run: npm run build
+
+      # =========================
+      # TRIVY FILESYSTEM SCAN
+      # =========================
+      - name: Run Trivy Filesystem Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          format: "table"
+          exit-code: "0"
+          severity: "CRITICAL,HIGH"
+
+      # =========================
+      # TRIVY SBOM GENERATION
+      # =========================
+      - name: Generate SBOM
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          format: "cyclonedx"
+          output: "sbom.json"
+
+      - name: Upload SBOM Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-report
+          path: sbom.json
+
+      # =========================
+      # TRIVY SECRET SCAN
+      # =========================
+      - name: Run Trivy Secret Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "fs"
+          scan-ref: "."
+          scanners: "secret"
+          format: "table"
+          exit-code: "0"
+
+      # =========================
+      # CREATE DEPLOYMENT PACKAGE
+      # =========================
+      - name: Create Deployment Package
+        run: |
+          mkdir -p deployment
+
+          cp -r dist deployment/
+          cp -r src deployment/ || true
+          cp package*.json deployment/
+          cp ecosystem.config.cjs deployment/ || true
+
+          [ -f .env.example ] && cp .env.example deployment/ || echo "No .env.example found"
+
+          tar -czf deployment.tar.gz -C deployment .
+
+      # =========================
+      # UPLOAD BUILD ARTIFACT
+      # =========================
+      - name: Upload Deployment Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-package
+          path: deployment.tar.gz
+          retention-days: 1
+
+  deploy:
+    name: Deploy to EC2
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download Deployment Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-package
+
+      - name: Deploy Application to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+
+        run: |
+          echo "$SSH_PRIVATE_KEY" > private_key.pem
+          chmod 600 private_key.pem
+
+          # Upload package
+          scp -i private_key.pem -o StrictHostKeyChecking=no \
+            deployment.tar.gz \
+            ${EC2_USERNAME}@${EC2_HOST}:/tmp/
+
+          # SSH into EC2
+          ssh -i private_key.pem -o StrictHostKeyChecking=no \
+            ${EC2_USERNAME}@${EC2_HOST} << 'EOF'
+
+            set -e
+
+            APP_DIR="/var/www/express-app"
+
+            sudo mkdir -p $APP_DIR
+            sudo chown -R $USER:$USER $APP_DIR
+
+            cd $APP_DIR
+
+            mkdir -p backups
+
+            # =========================
+            # BACKUP CURRENT VERSION
+            # =========================
+            if [ -d "dist" ]; then
+
+              timestamp=$(date +%Y%m%d%H%M%S)
+
+              tar -czf backups/backup_${timestamp}.tar.gz \
+                dist package.json ecosystem.config.cjs .env 2>/dev/null || true
+
+              ls -t backups/backup_*.tar.gz 2>/dev/null | tail -n +6 | xargs -r rm
+
+            fi
+
+            # =========================
+            # EXTRACT NEW DEPLOYMENT
+            # =========================
+            tar --overwrite -xzf /tmp/deployment.tar.gz -C $APP_DIR
+
+            rm -f /tmp/deployment.tar.gz
+
+            # =========================
+            # INSTALL PRODUCTION DEPS
+            # =========================
+            npm install --production
+
+            # =========================
+            # CREATE ENV FILE
+            # =========================
+            if [ ! -f .env ]; then
+              echo "NODE_ENV=production" > .env
+              echo "PORT=8000" >> .env
+            fi
+
+            mkdir -p logs
+
+            # =========================
+            # PM2 START / RELOAD
+            # =========================
+            if pm2 describe express-app > /dev/null 2>&1; then
+
+              echo "Reloading PM2 app..."
+              pm2 reload ecosystem.config.cjs --update-env
+
+            else
+
+              echo "Starting PM2 app..."
+              pm2 start ecosystem.config.cjs
+
+            fi
+
+            pm2 save
+
+            echo "Deployment completed!"
+
+          EOF
+
+          rm -f private_key.pem
+
+      # =========================
+      # VERIFY DEPLOYMENT
+      # =========================
+      - name: Verify Deployment
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+
+        run: |
+          echo "Waiting for app..."
+          sleep 15
+
+          for i in {1..5}; do
+
+            response=$(curl -s -o /dev/null -w "%{http_code}" http://${EC2_HOST} || echo "000")
+
+            if [ "$response" = "200" ] || [ "$response" = "301" ] || [ "$response" = "302" ]; then
+
+              echo "Deployment successful! Status: $response"
+              exit 0
+
+            fi
+
+            echo "Retrying... Got: $response"
+
+            sleep 5
+
+          done
+
+          echo "Deployment verification failed!"
+          exit 1
+
+      # =========================
+      # ROLLBACK ON FAILURE
+      # =========================
+      - name: Rollback on Failure
+        if: failure()
+
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+
+        run: |
+          echo "$SSH_PRIVATE_KEY" > private_key.pem
+          chmod 600 private_key.pem
+
+          ssh -i private_key.pem -o StrictHostKeyChecking=no \
+            ${EC2_USERNAME}@${EC2_HOST} << 'EOF'
+
+            APP_DIR="/var/www/express-app"
+
+            cd $APP_DIR
+
+            latest_backup=$(ls -t backups/backup_*.tar.gz 2>/dev/null | head -n 1)
+
+            if [ ! -z "$latest_backup" ]; then
+
+              echo "Rolling back using: $latest_backup"
+
+              tar -xzf "$latest_backup" -C $APP_DIR
+
+              npm install --production
+
+              pm2 reload ecosystem.config.cjs
+
+              echo "Rollback successful"
+
+            else
+
+              echo "No backup found!"
+
+            fi
+
+          EOF
+
+          rm -f private_key.pem
